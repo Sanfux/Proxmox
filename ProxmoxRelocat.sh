@@ -3,15 +3,21 @@ set -Eeuo pipefail
 
 # ============================================================
 # ProxmoxRelocat.sh
+# Version: 2026-05-21-v2
 #
-# One-file setup, fix, and check script for relocatable
-# standalone Proxmox VE appliances.
+# One-file setup, fix, full-upgrade, and check script for
+# standalone relocatable Proxmox VE appliances.
 #
 # Usage:
 #   /root/ProxmoxRelocat.sh setup
 #   /root/ProxmoxRelocat.sh check
 #   /root/ProxmoxRelocat.sh fix
+#   /root/ProxmoxRelocat.sh upgrade
 #   /root/ProxmoxRelocat.sh all
+#
+# Online usage:
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh | bash -s -- setup
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh | bash -s -- check
 #
 # Default action:
 #   setup
@@ -21,18 +27,28 @@ set -Eeuo pipefail
 #   AUTO_REBOOT=yes
 #   INSTALL_AVAHI=yes
 #   USE_NO_SUBSCRIPTION_REPO=yes
+#   RUN_FULL_UPGRADE_FIRST=yes
+#   REBOOT_AFTER_FULL_UPGRADE=no
 #   MAINTENANCE_SCHEDULE="Sun *-*-* 03:30:00"
 #
 # Example:
 #   BRIDGE=vmbr0 AUTO_REBOOT=yes /root/ProxmoxRelocat.sh all
+#
+# Notes:
+#   - Designed for standalone Proxmox nodes.
+#   - Do not use DHCP management networking on clustered Proxmox nodes.
 # ============================================================
 
 ACTION="${1:-setup}"
+
+SCRIPT_VERSION="2026-05-21-v2"
 
 BRIDGE="${BRIDGE:-vmbr0}"
 AUTO_REBOOT="${AUTO_REBOOT:-yes}"
 INSTALL_AVAHI="${INSTALL_AVAHI:-yes}"
 USE_NO_SUBSCRIPTION_REPO="${USE_NO_SUBSCRIPTION_REPO:-yes}"
+RUN_FULL_UPGRADE_FIRST="${RUN_FULL_UPGRADE_FIRST:-yes}"
+REBOOT_AFTER_FULL_UPGRADE="${REBOOT_AFTER_FULL_UPGRADE:-no}"
 MAINTENANCE_SCHEDULE="${MAINTENANCE_SCHEDULE:-Sun *-*-* 03:30:00}"
 
 BACKUP_ROOT="/root/pve-apt-source-backups"
@@ -41,6 +57,8 @@ CONFIG_FILE="/etc/default/pve-relocatable"
 PASS=0
 WARN=0
 FAIL=0
+
+CORE_REMOVAL_REGEX='^Remv (proxmox-ve|pve-manager|pve-cluster|qemu-server|lxc-pve|ifupdown2)( |$)'
 
 msg() {
   echo
@@ -64,6 +82,10 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
+timestamp() {
+  date +%Y%m%d-%H%M%S
+}
+
 require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "Run this script as root."
@@ -78,8 +100,8 @@ require_proxmox() {
   fi
 }
 
-timestamp() {
-  date +%Y%m%d-%H%M%S
+unit_exists() {
+  systemctl cat "$1" >/dev/null 2>&1
 }
 
 backup_file() {
@@ -162,8 +184,7 @@ for path in paths:
                 found = True
 
     elif path.suffix == ".sources":
-        stanzas = text.split("\n\n")
-        for stanza in stanzas:
+        for stanza in text.split("\n\n"):
             low = stanza.lower()
             if "enabled: no" in low:
                 continue
@@ -288,7 +309,7 @@ fix_apt_sources() {
 
   if [[ -f /etc/apt/sources.list.d/pve-no-subscription.list ]]; then
     if has_active_pve_no_subscription_sources_file; then
-      echo "Moving duplicate pve-no-subscription.list because active .sources repo already exists."
+      echo "Moving duplicate pve-no-subscription.list because an active .sources repo already exists."
       mv -f /etc/apt/sources.list.d/pve-no-subscription.list "$BACKUP_ROOT/pve-no-subscription.list.moved.$(timestamp)"
     fi
   fi
@@ -323,6 +344,115 @@ EOF
   fi
 
   fix_apt_sources
+}
+
+run_full_os_upgrade() {
+  msg "Running full Proxmox OS update before configuration"
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  echo "Updating package lists..."
+  apt-get update
+
+  echo "Running safe dist-upgrade simulation..."
+  local sim_file
+  sim_file="/tmp/proxmoxrelocat-dist-upgrade-simulation.txt"
+
+  if ! apt-get -s dist-upgrade > "$sim_file"; then
+    echo "apt-get dist-upgrade simulation failed. Review: $sim_file"
+    exit 1
+  fi
+
+  if grep -Eq "$CORE_REMOVAL_REGEX" "$sim_file"; then
+    echo "ABORTING: upgrade simulation wants to remove core Proxmox packages."
+    echo "Review: $sim_file"
+    grep -E "$CORE_REMOVAL_REGEX" "$sim_file" || true
+    exit 20
+  fi
+
+  echo "Applying full OS upgrade..."
+  apt-get \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    -y dist-upgrade
+
+  echo "Cleaning unused packages..."
+  apt-get -y autoremove --purge
+  apt-get -y autoclean
+
+  local reboot_needed="no"
+
+  if [[ -f /var/run/reboot-required ]]; then
+    reboot_needed="yes"
+  fi
+
+  local running_kernel latest_kernel
+  running_kernel="$(uname -r)"
+  latest_kernel="$(find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -n 1 || true)"
+
+  if [[ -n "$latest_kernel" && "$latest_kernel" != "$running_kernel" ]]; then
+    echo "Running kernel: $running_kernel"
+    echo "Latest installed kernel: $latest_kernel"
+    reboot_needed="yes"
+  fi
+
+  if [[ "$reboot_needed" == "yes" ]]; then
+    echo
+    echo "A reboot is needed after the OS upgrade."
+
+    if [[ "$REBOOT_AFTER_FULL_UPGRADE" == "yes" ]]; then
+      echo "REBOOT_AFTER_FULL_UPGRADE=yes, rebooting now."
+      systemctl reboot
+      exit 0
+    else
+      echo "Continuing setup now. Reboot after this script finishes."
+    fi
+  else
+    echo "No reboot appears to be required after the OS upgrade."
+  fi
+}
+
+install_packages() {
+  msg "Installing helper packages"
+
+  apt-get update
+
+  local packages
+  packages=(
+    ca-certificates
+    curl
+    unattended-upgrades
+    apt-listchanges
+  )
+
+  if [[ "$INSTALL_AVAHI" == "yes" ]]; then
+    packages+=(
+      avahi-daemon
+      avahi-utils
+      libnss-mdns
+    )
+  fi
+
+  apt-get install -y "${packages[@]}"
+
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+
+  cat > /etc/apt/apt.conf.d/51pve-unattended-upgrades <<'EOF'
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename},label=Debian";
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
+        "origin=Proxmox,codename=${distro_codename}";
+};
+
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+EOF
 }
 
 configure_network_dhcp() {
@@ -570,7 +700,7 @@ EnvironmentFile=${CONFIG_FILE}
 ExecStart=/usr/local/sbin/pve-update-hosts-ip
 EOF
 
-  cat > /etc/systemd/system/pve-update-hosts-ip.timer <<EOF
+  cat > /etc/systemd/system/pve-update-hosts-ip.timer <<'EOF'
 [Unit]
 Description=Periodically update Proxmox /etc/hosts with DHCP address
 
@@ -615,10 +745,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 
 echo "$(date -Is) Simulating full upgrade first..."
-SIMULATION="$(apt-get -s dist-upgrade || true)"
-echo "$SIMULATION"
+SIM_FILE="/tmp/pve-auto-maintenance-dist-upgrade-simulation.txt"
 
-if echo "$SIMULATION" | grep -Eq '^Remv (proxmox-ve|pve-manager|pve-cluster|qemu-server|lxc-pve|ifupdown2)( |$)'; then
+if ! apt-get -s dist-upgrade > "$SIM_FILE"; then
+  echo "$(date -Is) ABORTING: upgrade simulation failed. Review $SIM_FILE"
+  exit 10
+fi
+
+cat "$SIM_FILE"
+
+if grep -Eq '^Remv (proxmox-ve|pve-manager|pve-cluster|qemu-server|lxc-pve|ifupdown2)( |$)' "$SIM_FILE"; then
   echo "$(date -Is) ABORTING: simulation wants to remove core Proxmox packages."
   exit 20
 fi
@@ -660,7 +796,7 @@ EOF
 
   chmod +x /usr/local/sbin/pve-auto-maintenance
 
-  cat > /etc/systemd/system/pve-auto-maintenance.service <<EOF
+  cat > /etc/systemd/system/pve-auto-maintenance.service <<'EOF'
 [Unit]
 Description=Automatic Proxmox maintenance and upgrades
 Wants=network-online.target
@@ -685,49 +821,6 @@ WantedBy=timers.target
 EOF
 }
 
-install_packages() {
-  msg "Installing helper packages"
-
-  apt-get update
-
-  local packages
-  packages=(
-    ca-certificates
-    curl
-    unattended-upgrades
-    apt-listchanges
-  )
-
-  if [[ "$INSTALL_AVAHI" == "yes" ]]; then
-    packages+=(
-      avahi-daemon
-      avahi-utils
-      libnss-mdns
-    )
-  fi
-
-  apt-get install -y "${packages[@]}"
-
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-
-  cat > /etc/apt/apt.conf.d/51pve-unattended-upgrades <<EOF
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=\${distro_codename},label=Debian";
-        "origin=Debian,codename=\${distro_codename}-security,label=Debian-Security";
-        "origin=Debian,codename=\${distro_codename}-updates,label=Debian";
-        "origin=Proxmox,codename=\${distro_codename}";
-};
-
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-EOF
-}
-
 enable_services() {
   msg "Enabling systemd timers and services"
 
@@ -737,7 +830,7 @@ enable_services() {
   systemctl enable --now pve-auto-maintenance.timer
 
   if [[ "$INSTALL_AVAHI" == "yes" ]]; then
-    systemctl enable --now avahi-daemon.service
+    systemctl enable --now avahi-daemon.service || true
   fi
 
   systemctl start pve-update-hosts-ip.service || true
@@ -749,8 +842,16 @@ run_setup() {
   check_not_clustered
 
   msg "Starting Proxmox relocatable setup"
+  echo "Script version: $SCRIPT_VERSION"
 
   configure_repositories
+
+  if [[ "$RUN_FULL_UPGRADE_FIRST" == "yes" ]]; then
+    run_full_os_upgrade
+  else
+    echo "RUN_FULL_UPGRADE_FIRST is not yes. Skipping pre-setup full OS upgrade."
+  fi
+
   install_packages
   configure_network_dhcp
   write_default_config
@@ -765,7 +866,7 @@ run_setup() {
   echo "  reboot"
   echo
   echo "After reboot, run:"
-  echo "  /root/ProxmoxRelocat.sh check"
+  echo "  curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh | bash -s -- check"
   echo
   echo "Access Proxmox at:"
   echo "  https://<DHCP-IP>:8006"
@@ -777,17 +878,29 @@ run_fix() {
   require_proxmox
 
   msg "Running ProxmoxRelocat fix"
+  echo "Script version: $SCRIPT_VERSION"
 
   configure_repositories
 
-  if ! command -v avahi-resolve-host-name >/dev/null 2>&1; then
-    echo "Installing avahi-utils because avahi-resolve-host-name is missing."
-    apt-get update
-    apt-get install -y avahi-utils
+  if [[ "$RUN_FULL_UPGRADE_FIRST" == "yes" ]]; then
+    run_full_os_upgrade
   fi
 
-  if systemctl list-unit-files | grep -q '^avahi-daemon.service'; then
+  if [[ "$INSTALL_AVAHI" == "yes" ]]; then
+    echo "Installing Avahi packages."
+    apt-get update
+    apt-get install -y avahi-daemon avahi-utils libnss-mdns
     systemctl enable --now avahi-daemon.service || true
+  fi
+
+  systemctl daemon-reload
+
+  if unit_exists pve-update-hosts-ip.timer; then
+    systemctl enable --now pve-update-hosts-ip.timer || true
+  fi
+
+  if unit_exists pve-auto-maintenance.timer; then
+    systemctl enable --now pve-auto-maintenance.timer || true
   fi
 
   apt-get update
@@ -801,6 +914,8 @@ run_check() {
   PASS=0
   WARN=0
   FAIL=0
+
+  echo "ProxmoxRelocat.sh version: $SCRIPT_VERSION"
 
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -882,13 +997,13 @@ run_check() {
     fail "Missing /usr/local/sbin/pve-update-hosts-ip"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-update-hosts-ip.service'; then
+  if unit_exists pve-update-hosts-ip.service; then
     pass "pve-update-hosts-ip.service exists"
   else
     fail "pve-update-hosts-ip.service missing"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-update-hosts-ip.timer'; then
+  if unit_exists pve-update-hosts-ip.timer; then
     pass "pve-update-hosts-ip.timer exists"
   else
     fail "pve-update-hosts-ip.timer missing"
@@ -956,7 +1071,7 @@ run_check() {
 
   msg "Avahi / .local discovery check"
 
-  if systemctl list-unit-files | grep -q '^avahi-daemon.service'; then
+  if unit_exists avahi-daemon.service; then
     pass "avahi-daemon.service exists"
 
     if systemctl is-active --quiet avahi-daemon.service; then
@@ -972,10 +1087,10 @@ run_check() {
         warn "${HOST_SHORT}.local did not resolve locally through Avahi"
       fi
     else
-      warn "avahi-resolve-host-name not found, skipping .local resolution test"
+      warn "avahi-resolve-host-name not found. Run: $0 fix"
     fi
   else
-    warn "Avahi is not installed. .local discovery may not work"
+    warn "Avahi is not installed. Run: $0 fix"
   fi
 
   msg "Automatic maintenance check"
@@ -986,13 +1101,13 @@ run_check() {
     fail "Missing /usr/local/sbin/pve-auto-maintenance"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-auto-maintenance.service'; then
+  if unit_exists pve-auto-maintenance.service; then
     pass "pve-auto-maintenance.service exists"
   else
     fail "pve-auto-maintenance.service missing"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-auto-maintenance.timer'; then
+  if unit_exists pve-auto-maintenance.timer; then
     pass "pve-auto-maintenance.timer exists"
   else
     fail "pve-auto-maintenance.timer missing"
@@ -1022,23 +1137,37 @@ run_check() {
     warn "Proxmox no-subscription repository not found"
   fi
 
-  ACTIVE_ENTERPRISE="$(
+  ACTIVE_ENTERPRISE_LIST="$(
     grep -RhsE "^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
   )"
 
   ACTIVE_ENTERPRISE_SOURCES="$(
-    grep -Ril "enterprise.proxmox.com" /etc/apt/sources.list.d/*.sources 2>/dev/null | while read -r f; do
-      if ! grep -qi "Enabled:[[:space:]]*no" "$f"; then
-        echo "$f"
-      fi
-    done || true
+    python3 <<'PY'
+from pathlib import Path
+
+sources_dir = Path("/etc/apt/sources.list.d")
+if not sources_dir.exists():
+    raise SystemExit(0)
+
+for path in sorted(sources_dir.glob("*.sources")):
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        continue
+
+    for stanza in text.split("\n\n"):
+        low = stanza.lower()
+        if "enterprise.proxmox.com" in low and "enabled: no" not in low:
+            print(path)
+            break
+PY
   )"
 
-  if [[ -z "$ACTIVE_ENTERPRISE" && -z "$ACTIVE_ENTERPRISE_SOURCES" ]]; then
+  if [[ -z "$ACTIVE_ENTERPRISE_LIST" && -z "$ACTIVE_ENTERPRISE_SOURCES" ]]; then
     pass "No active enterprise.proxmox.com repo found"
   else
     warn "Active Proxmox enterprise repo may still be enabled:"
-    echo "$ACTIVE_ENTERPRISE"
+    echo "$ACTIVE_ENTERPRISE_LIST"
     echo "$ACTIVE_ENTERPRISE_SOURCES"
   fi
 
@@ -1065,11 +1194,11 @@ run_check() {
   fi
 
   if grep -q "configured multiple times" "$APT_LOG"; then
-    warn "APT still reports duplicate repository entries. Run: /root/ProxmoxRelocat.sh fix"
+    warn "APT still reports duplicate repository entries. Run: $0 fix"
   fi
 
   if grep -q "Ignoring file" "$APT_LOG"; then
-    warn "APT is ignoring invalid files in sources.list.d. Run: /root/ProxmoxRelocat.sh fix"
+    warn "APT is ignoring invalid files in sources.list.d. Run: $0 fix"
   fi
 
   echo "Running safe upgrade simulation. No packages will be changed..."
@@ -1082,7 +1211,7 @@ run_check() {
     fail "apt-get dist-upgrade simulation failed"
   fi
 
-  if grep -Eq '^Remv (proxmox-ve|pve-manager|pve-cluster|qemu-server|lxc-pve|ifupdown2)( |$)' "$SIM_FILE"; then
+  if grep -Eq "$CORE_REMOVAL_REGEX" "$SIM_FILE"; then
     fail "Upgrade simulation wants to remove core Proxmox packages. Review $SIM_FILE"
   else
     pass "Upgrade simulation does not remove core Proxmox packages"
@@ -1130,23 +1259,43 @@ Usage:
   $0 setup
   $0 check
   $0 fix
+  $0 upgrade
   $0 all
 
 Default:
   $0 setup
+
+Actions:
+  setup     Configure Proxmox as a relocatable standalone appliance.
+            This first fixes repositories and runs a full OS upgrade.
+
+  check     Verify DHCP, hostname, Proxmox services, APT, update safety,
+            timers, and Avahi.
+
+  fix       Fix APT source issues, install Avahi packages, reload systemd,
+            and run a full OS upgrade by default.
+
+  upgrade   Only fix repositories and run a full safe OS upgrade.
+
+  all       Run setup, fix, then check.
+
+Environment options:
+  BRIDGE=vmbr0
+  AUTO_REBOOT=yes
+  INSTALL_AVAHI=yes
+  USE_NO_SUBSCRIPTION_REPO=yes
+  RUN_FULL_UPGRADE_FIRST=yes
+  REBOOT_AFTER_FULL_UPGRADE=no
+  MAINTENANCE_SCHEDULE="Sun *-*-* 03:30:00"
 
 Examples:
   $0 setup
   reboot
   $0 check
 
-  BRIDGE=vmbr0 AUTO_REBOOT=yes $0 all
+  curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh | bash -s -- setup
 
-Actions:
-  setup   Configure Proxmox as a relocatable standalone appliance.
-  check   Verify DHCP, hostname, Proxmox services, APT, updates, and Avahi.
-  fix     Clean APT duplicates/backups and install missing Avahi test tools.
-  all     Run setup, fix, then check.
+  curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh | bash -s -- check
 EOF
 }
 
@@ -1159,6 +1308,12 @@ case "$ACTION" in
     ;;
   fix)
     run_fix
+    ;;
+  upgrade)
+    require_root
+    require_proxmox
+    configure_repositories
+    run_full_os_upgrade
     ;;
   all)
     run_setup
