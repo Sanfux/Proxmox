@@ -200,13 +200,62 @@ sys.exit(0 if found else 1)
 PY
 }
 
+# Self-heal: detect .sources files that no longer parse (apt-get returns
+# "Malformed stanza ...") and move them aside so the rest of the script can run.
+quarantine_broken_sources() {
+  shopt -s nullglob
+  local broken=()
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    if ! apt-get -o Debug::NoLocking=true -o APT::Get::List-Cleanup=0 \
+         --print-uris -qq update >/dev/null 2>&1; then :; fi
+    # Per-file parse check via apt-helper if available, else a cheap python check.
+    if ! python3 - "$f" <<'PY' >/dev/null 2>&1
+import re, sys
+text = open(sys.argv[1], errors="ignore").read()
+stanzas = [s for s in re.split(r"\n[ \t]*\n", text.strip("\n")) if s.strip()]
+ok = True
+for s in stanzas:
+    fields = {}
+    for line in s.splitlines():
+        ls = line.strip()
+        if not ls or ls.startswith("#"):
+            continue
+        m = re.match(r"([A-Za-z0-9-]+)\s*:", line)
+        if not m:
+            ok = False; break
+        fields[m.group(1).lower()] = True
+    if not ok: break
+    if "types" not in fields or "uris" not in fields or "suites" not in fields:
+        ok = False; break
+sys.exit(0 if ok else 1)
+PY
+    then
+      broken+=("$f")
+    fi
+  done
+  shopt -u nullglob
+
+  if (( ${#broken[@]} )); then
+    mkdir -p "$BACKUP_ROOT"
+    for f in "${broken[@]}"; do
+      local dest="$BACKUP_ROOT/$(basename "$f").broken.$(timestamp)"
+      mv -f "$f" "$dest"
+      echo "Quarantined malformed APT source file: $f -> $dest"
+    done
+  fi
+}
+
 disable_enterprise_repos() {
   msg "Disabling active Proxmox enterprise repositories"
 
   mkdir -p "$BACKUP_ROOT"
 
+  quarantine_broken_sources
+
   shopt -s nullglob
 
+  # ---- legacy single-line *.list files -------------------------------------
   for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
     [[ -f "$file" ]] || continue
 
@@ -217,47 +266,77 @@ disable_enterprise_repos() {
     fi
   done
 
+  # ---- deb822 *.sources files ---------------------------------------------
+  # Strategy:
+  #   1. If EVERY stanza in the file references enterprise.proxmox.com,
+  #      rename the file to .sources.disabled (APT ignores it).
+  #   2. Otherwise, rewrite only the enterprise stanzas with Enabled: no,
+  #      preserving comments, blank lines and other stanzas exactly.
   for file in /etc/apt/sources.list.d/*.sources; do
     [[ -f "$file" ]] || continue
+    grep -qi "enterprise.proxmox.com" "$file" || continue
 
-    if grep -qi "enterprise.proxmox.com" "$file"; then
-      backup_file "$file"
+    backup_file "$file"
 
-      python3 - "$file" <<'PY'
+    if python3 - "$file" <<'PY'
+import re, sys
 from pathlib import Path
-import sys
 
 path = Path(sys.argv[1])
 text = path.read_text(errors="ignore")
 
-parts = text.split("\n\n")
-new_parts = []
+# Split into stanzas on blank lines (one or more lines containing only whitespace).
+# Re.split keeps no separators, so we lose the exact blank-line count between
+# stanzas; we re-join with a single blank line which deb822 always accepts.
+raw_stanzas = re.split(r"\n[ \t]*\n", text.strip("\n"))
+stanzas = [s for s in raw_stanzas if s.strip()]
 
-for stanza in parts:
-    if "enterprise.proxmox.com" not in stanza.lower():
-        new_parts.append(stanza)
+def is_enterprise(stanza: str) -> bool:
+    for line in stanza.splitlines():
+        ls = line.strip()
+        if not ls or ls.startswith("#"):
+            continue
+        if "enterprise.proxmox.com" in line.lower():
+            return True
+    return False
+
+def has_field(stanza: str, name: str) -> bool:
+    pat = re.compile(rf"^{re.escape(name)}\s*:", re.IGNORECASE | re.MULTILINE)
+    return bool(pat.search(stanza))
+
+enterprise = [s for s in stanzas if is_enterprise(s)]
+other      = [s for s in stanzas if not is_enterprise(s)]
+
+# Caller decides what to do: rename if everything is enterprise.
+if not other:
+    sys.exit(2)
+
+# Mixed file -> disable only the enterprise stanzas
+new_stanzas = []
+for s in stanzas:
+    if not is_enterprise(s):
+        new_stanzas.append(s)
         continue
+    if has_field(s, "Enabled"):
+        s = re.sub(r"^Enabled\s*:.*$", "Enabled: no",
+                   s, flags=re.IGNORECASE | re.MULTILINE)
+    else:
+        s = s.rstrip() + "\nEnabled: no"
+    new_stanzas.append(s)
 
-    lines = stanza.splitlines()
-    has_enabled = False
-    new_lines = []
-
-    for line in lines:
-        if line.lower().startswith("enabled:"):
-            new_lines.append("Enabled: no")
-            has_enabled = True
-        else:
-            new_lines.append(line)
-
-    if not has_enabled:
-        new_lines.append("Enabled: no")
-
-    new_parts.append("\n".join(new_lines))
-
-path.write_text("\n\n".join(new_parts).rstrip() + "\n")
+path.write_text("\n\n".join(new_stanzas) + "\n")
+sys.exit(0)
 PY
-
-      echo "Disabled enterprise source stanza in: $file"
+    then
+      echo "Disabled enterprise stanza(s) in: $file"
+    else
+      rc=$?
+      if [[ $rc -eq 2 ]]; then
+        mv -f "$file" "${file}.disabled"
+        echo "Disabled enterprise-only source file (renamed): $file -> ${file}.disabled"
+      else
+        echo "WARNING: failed to process $file (python exit $rc); leaving as-is" >&2
+      fi
     fi
   done
 
