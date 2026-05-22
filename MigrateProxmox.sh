@@ -1,12 +1,43 @@
 #!/usr/bin/env bash
-# migrate-proxmox.sh
+# MigrateProxmox.sh
 # -----------------------------------------------------------------------------
 # Migrate all LXC containers and QEMU VMs from THIS Proxmox node to another
 # Proxmox node, with automatic VMID-collision handling and bridge remapping.
 #
 # Run this script ON THE SOURCE node as root.
+# -----------------------------------------------------------------------------
+# RUN DIRECTLY FROM GITHUB (no local copy needed)
 #
-# Workflow per guest:
+# The canonical copy lives at:
+#   https://github.com/Sanfux/Proxmox/blob/main/MigrateProxmox.sh
+# Raw URL used below:
+#   https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh
+#
+# Option A - pipe straight into bash (CLI flags after `--`):
+#
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh \
+#     | bash -s -- --target 10.94.32.127 --target-pass 'YOURPASS' \
+#                  --regenerate-mac --test-boot
+#
+# Option B - process substitution, drive it with env vars instead of flags:
+#
+#   TARGET_HOST=10.94.32.127 \
+#   TARGET_PASS='YOURPASS' \
+#   REGEN_MAC=1 TEST_BOOT=1 \
+#     bash <(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh)
+#
+# Option C - download once, inspect, then run (recommended for production):
+#
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh \
+#     -o /root/MigrateProxmox.sh
+#   chmod +x /root/MigrateProxmox.sh
+#   less /root/MigrateProxmox.sh           # review before running
+#   /root/MigrateProxmox.sh --target 10.94.32.127 --target-pass 'YOURPASS'
+#
+# If you use --target-pass, install sshpass first:
+#   apt-get update && apt-get install -y sshpass
+# -----------------------------------------------------------------------------
+# WORKFLOW PER GUEST
 #   1. Shut it down on the source if it was running.
 #   2. vzdump (zstd) into $DUMP_DIR.
 #   3. scp to the target.
@@ -24,8 +55,8 @@
 #
 # Idempotent: safe to re-run. Existing target guests are never modified.
 # -----------------------------------------------------------------------------
-# Usage:
-#   ./migrate-proxmox.sh --target <ip|host> [options]
+# USAGE
+#   ./MigrateProxmox.sh --target <ip|host> [options]
 #
 # Required:
 #   --target HOST            Target Proxmox node (IP or DNS)
@@ -47,10 +78,10 @@
 #   -h, --help               Show this help
 #
 # Examples:
-#   ./migrate-proxmox.sh --target 10.0.0.20
-#   ./migrate-proxmox.sh --target tgt.lan --regenerate-mac --test-boot
-#   ./migrate-proxmox.sh --target 10.0.0.20 --only-ids "100 200" \
-#                        --storage local-zfs --bridge vmbr1 --suffix ''
+#   ./MigrateProxmox.sh --target 10.0.0.20
+#   ./MigrateProxmox.sh --target tgt.lan --regenerate-mac --test-boot
+#   ./MigrateProxmox.sh --target 10.0.0.20 --only-ids "100 200" \
+#                       --storage local-zfs --bridge vmbr1 --suffix ''
 #
 # Security:
 #   - Prefer setting up SSH key auth to the target beforehand and omitting
