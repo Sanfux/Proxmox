@@ -1,31 +1,105 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
+# =============================================================================
 # ProxmoxRelocat.sh
+# -----------------------------------------------------------------------------
+# One-file setup / fix / check script that turns a freshly-installed standalone
+# Proxmox VE host into a "relocatable appliance":
 #
-# One-file setup, fix, and check script for relocatable
-# standalone Proxmox VE appliances.
+#   * Switches the management bridge (default vmbr0) to DHCP.
+#   * Replaces the Proxmox enterprise repo with the no-subscription repo.
+#   * Keeps /etc/hosts and the on-console banner (/etc/issue) in sync with the
+#     current DHCP address - so when you unplug the box, move it to another
+#     network, and plug it back in, https://<hostname>.local:8006 keeps working
+#     and the bare-metal screen always shows the right IP.
+#   * Installs an Avahi mDNS responder so <hostname>.local is discoverable.
+#   * Installs a weekly unattended-upgrade + auto-reboot maintenance job.
 #
-# Usage:
+# Do NOT use on a node that is part of a Proxmox cluster - the script refuses
+# to run there. Designed for single-node home/lab/edge boxes.
+# -----------------------------------------------------------------------------
+# QUICK START - run as root on the Proxmox host:
+#
+#   # Easiest: pipe directly from GitHub (no local copy needed)
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh \
+#     | bash -s -- setup
+#
+#   # Or: download once and run locally
+#   curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/ProxmoxRelocat.sh \
+#     -o /root/ProxmoxRelocat.sh
+#   chmod +x /root/ProxmoxRelocat.sh
 #   /root/ProxmoxRelocat.sh setup
+#   reboot
 #   /root/ProxmoxRelocat.sh check
-#   /root/ProxmoxRelocat.sh fix
-#   /root/ProxmoxRelocat.sh all
+# -----------------------------------------------------------------------------
+# ACTIONS
 #
-# Default action:
-#   setup
+#   setup   First-time configuration. Writes the helper scripts, the systemd
+#           units, switches the bridge to DHCP, sets up the no-subscription
+#           repo, installs Avahi + unattended-upgrades, and enables timers.
+#           Safe to re-run; idempotent.
 #
-# Environment options:
-#   BRIDGE=vmbr0
-#   AUTO_REBOOT=yes
-#   INSTALL_AVAHI=yes
-#   USE_NO_SUBSCRIPTION_REPO=yes
-#   MAINTENANCE_SCHEDULE="Sun *-*-* 03:30:00"
+#   check   Read-only health check. Verifies bridge/DHCP/IP, /etc/hosts, the
+#           pve-update-hosts-ip + pve-auto-maintenance services and timers,
+#           pveproxy/pvedaemon, APT sources, simulates a dist-upgrade, and
+#           tests Avahi .local resolution. Prints PASS / WARN / FAIL counts.
 #
-# Example:
-#   BRIDGE=vmbr0 AUTO_REBOOT=yes /root/ProxmoxRelocat.sh all
-# ============================================================
+#   fix     Recovery action. Re-installs missing packages, re-writes the
+#           helper scripts and systemd units, re-enables timers, and clears
+#           known APT-sources problems (malformed deb822 stanzas, stale .bak
+#           files in /etc/apt/sources.list.d, duplicate no-subscription
+#           entries). Run this if a previous setup aborted halfway.
+#
+#   all     setup -> fix -> check
+#
+#   Default action when no argument is given: setup
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES (all optional)
+#
+#   BRIDGE=vmbr0                       Linux bridge to switch to DHCP
+#   AUTO_REBOOT=yes                    Reboot after auto-maintenance if needed
+#   INSTALL_AVAHI=yes                  Install + enable avahi-daemon
+#   USE_NO_SUBSCRIPTION_REPO=yes       Add the Proxmox no-subscription repo
+#   MAINTENANCE_SCHEDULE="Sun *-*-* 03:30:00"  systemd OnCalendar expression
+#
+#   Example:
+#     BRIDGE=vmbr0 AUTO_REBOOT=yes INSTALL_AVAHI=no \
+#       /root/ProxmoxRelocat.sh all
+# -----------------------------------------------------------------------------
+# FILES IT CREATES
+#
+#   /etc/default/pve-relocatable                       runtime config
+#   /usr/local/sbin/pve-update-hosts-ip                /etc/hosts + banner updater
+#   /usr/local/sbin/pve-auto-maintenance               weekly upgrade runner
+#   /etc/systemd/system/pve-update-hosts-ip.{service,timer}
+#   /etc/systemd/system/pve-auto-maintenance.{service,timer}
+#   /etc/apt/sources.list.d/pve-no-subscription.list   (if needed)
+#   /etc/apt/apt.conf.d/{20auto-upgrades,51pve-unattended-upgrades}
+#   /root/pve-apt-source-backups/                      timestamped backups
+#   /var/lib/pve-relocatable/last-ip                   last-seen DHCP address
+#   /var/log/pve-auto-maintenance.log                  maintenance run log
+#
+# All originals are backed up under /root/pve-apt-source-backups/ before any
+# in-place edit. Nothing in /etc/pve is touched.
+# -----------------------------------------------------------------------------
+# TROUBLESHOOTING
+#
+#   # See what the next run would do (no changes):
+#   /root/ProxmoxRelocat.sh check
+#
+#   # Force an immediate /etc/hosts + console-banner refresh:
+#   systemctl start pve-update-hosts-ip.service
+#   journalctl -u pve-update-hosts-ip.service -n 30 --no-pager
+#
+#   # Manually trigger the weekly maintenance run (uses /var/log):
+#   systemctl start pve-auto-maintenance.service
+#   tail -f /var/log/pve-auto-maintenance.log
+#
+#   # Restore a backed-up APT source file:
+#   ls /root/pve-apt-source-backups/
+#   cp /root/pve-apt-source-backups/<file>.bak.<ts> /etc/apt/sources.list.d/<file>
+# =============================================================================
 
 ACTION="${1:-setup}"
 
@@ -835,13 +909,24 @@ EOF
 enable_services() {
   msg "Enabling systemd timers and services"
 
+  # Self-heal: if any unit file is missing (e.g. earlier setup aborted),
+  # write it now.
+  [[ -x /usr/local/sbin/pve-update-hosts-ip      ]] || write_update_hosts_service
+  [[ -x /usr/local/sbin/pve-auto-maintenance     ]] || write_auto_maintenance_service
+  [[ -f /etc/systemd/system/pve-update-hosts-ip.service  ]] || write_update_hosts_service
+  [[ -f /etc/systemd/system/pve-auto-maintenance.service ]] || write_auto_maintenance_service
+
   systemctl daemon-reload
 
-  systemctl enable --now pve-update-hosts-ip.timer
-  systemctl enable --now pve-auto-maintenance.timer
+  systemctl enable --now pve-update-hosts-ip.timer       || warn "Could not enable pve-update-hosts-ip.timer"
+  systemctl enable --now pve-auto-maintenance.timer      || warn "Could not enable pve-auto-maintenance.timer"
 
   if [[ "$INSTALL_AVAHI" == "yes" ]]; then
-    systemctl enable --now avahi-daemon.service
+    if systemctl list-unit-files | grep -q '^avahi-daemon.service'; then
+      systemctl enable --now avahi-daemon.service || true
+    else
+      echo "avahi-daemon.service not present; will be enabled after install_packages succeeds."
+    fi
   fi
 
   systemctl start pve-update-hosts-ip.service || true
@@ -854,12 +939,23 @@ run_setup() {
 
   msg "Starting Proxmox relocatable setup"
 
-  configure_repositories
-  install_packages
-  configure_network_dhcp
+  # Write the local helpers and systemd units FIRST. These do not depend on
+  # APT or networking, so they always succeed -- ensuring that even if a
+  # later step fails, the relocatable host-IP and maintenance services exist
+  # and can be enabled on the next run.
   write_default_config
   write_update_hosts_service
   write_auto_maintenance_service
+
+  configure_repositories
+
+  # install_packages may fail (network, mirror outage, etc.) -- don't let that
+  # leave the host without enabled services. Capture failure, continue, warn.
+  if ! install_packages; then
+    warn "install_packages failed; continuing so service units still get enabled."
+  fi
+
+  configure_network_dhcp
   enable_services
   fix_apt_sources
 
@@ -884,15 +980,17 @@ run_fix() {
 
   configure_repositories
 
-  if ! command -v avahi-resolve-host-name >/dev/null 2>&1; then
-    echo "Installing avahi-utils because avahi-resolve-host-name is missing."
-    apt-get update
-    apt-get install -y avahi-utils
+  # Make sure all helper packages are present (the original install_packages
+  # may have been skipped if a previous setup aborted).
+  if ! install_packages; then
+    warn "install_packages failed during fix; check APT output above."
   fi
 
-  if systemctl list-unit-files | grep -q '^avahi-daemon.service'; then
-    systemctl enable --now avahi-daemon.service || true
-  fi
+  # Make sure the relocatable systemd units exist and are enabled.
+  write_default_config
+  write_update_hosts_service
+  write_auto_maintenance_service
+  enable_services
 
   apt-get update
 
@@ -980,19 +1078,25 @@ run_check() {
 
   msg "Hostname and /etc/hosts check"
 
+  # Make sure systemd has the latest view of the service unit files before
+  # we test them, otherwise a freshly-written unit appears "missing".
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   if [[ -x /usr/local/sbin/pve-update-hosts-ip ]]; then
     pass "Found /usr/local/sbin/pve-update-hosts-ip"
   else
     fail "Missing /usr/local/sbin/pve-update-hosts-ip"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-update-hosts-ip.service'; then
+  if [[ -f /etc/systemd/system/pve-update-hosts-ip.service ]] \
+     || systemctl list-unit-files | grep -q '^pve-update-hosts-ip.service'; then
     pass "pve-update-hosts-ip.service exists"
   else
     fail "pve-update-hosts-ip.service missing"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-update-hosts-ip.timer'; then
+  if [[ -f /etc/systemd/system/pve-update-hosts-ip.timer ]] \
+     || systemctl list-unit-files | grep -q '^pve-update-hosts-ip.timer'; then
     pass "pve-update-hosts-ip.timer exists"
   else
     fail "pve-update-hosts-ip.timer missing"
@@ -1090,13 +1194,15 @@ run_check() {
     fail "Missing /usr/local/sbin/pve-auto-maintenance"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-auto-maintenance.service'; then
+  if [[ -f /etc/systemd/system/pve-auto-maintenance.service ]] \
+     || systemctl list-unit-files | grep -q '^pve-auto-maintenance.service'; then
     pass "pve-auto-maintenance.service exists"
   else
     fail "pve-auto-maintenance.service missing"
   fi
 
-  if systemctl list-unit-files | grep -q '^pve-auto-maintenance.timer'; then
+  if [[ -f /etc/systemd/system/pve-auto-maintenance.timer ]] \
+     || systemctl list-unit-files | grep -q '^pve-auto-maintenance.timer'; then
     pass "pve-auto-maintenance.timer exists"
   else
     fail "pve-auto-maintenance.timer missing"
