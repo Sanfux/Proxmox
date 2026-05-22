@@ -115,6 +115,9 @@ CONFIG_FILE="/etc/default/pve-relocatable"
 PASS=0
 WARN=0
 FAIL=0
+PASS_ITEMS=()
+WARN_ITEMS=()
+FAIL_ITEMS=()
 
 msg() {
   echo
@@ -126,16 +129,19 @@ msg() {
 pass() {
   echo "[PASS] $*"
   PASS=$((PASS + 1))
+  PASS_ITEMS+=("$*")
 }
 
 warn() {
   echo "[WARN] $*"
   WARN=$((WARN + 1))
+  WARN_ITEMS+=("$*")
 }
 
 fail() {
   echo "[FAIL] $*"
   FAIL=$((FAIL + 1))
+  FAIL_ITEMS+=("$*")
 }
 
 require_root() {
@@ -1320,6 +1326,33 @@ run_check() {
 
   if [[ "$FAIL" -gt 0 ]]; then
     echo
+    echo "------------------------------------------------------------"
+    echo "FAILED checks:"
+    for item in "${FAIL_ITEMS[@]}"; do
+      echo "  [FAIL] $item"
+    done
+  fi
+
+  if [[ "$WARN" -gt 0 ]]; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "WARNINGS:"
+    for item in "${WARN_ITEMS[@]}"; do
+      echo "  [WARN] $item"
+    done
+  fi
+
+  if [[ "$PASS" -gt 0 ]]; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "PASSED checks:"
+    for item in "${PASS_ITEMS[@]}"; do
+      echo "  [PASS] $item"
+    done
+  fi
+
+  echo
+  if [[ "$FAIL" -gt 0 ]]; then
     echo "Result: FAILED"
     exit 1
   fi
