@@ -33,24 +33,27 @@ Run this script **on the source node** as `root`.
 ## Quick Start
 
 ```bash
-# Download, inspect, then run (recommended for production)
-curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh \
-  -o /root/MigrateProxmox.sh
-chmod +x /root/MigrateProxmox.sh
-less /root/MigrateProxmox.sh
-/root/MigrateProxmox.sh --target 10.0.0.20 --target-pass 'YOURPASS'
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)"
 ```
 
-Or pipe directly into bash:
+With flags:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh \
-  | bash -s -- --target 10.0.0.20 --target-pass 'YOURPASS'
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)" \
+  -- --target 10.0.0.20 --target-pass 'YOURPASS'
 ```
 
-Or use environment variables (great for `curl | bash` usage):
+Or use environment variables:
 ```bash
 TARGET_HOST=10.0.0.20 TARGET_PASS='YOURPASS' REGEN_MAC=1 \
-  bash <(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox.sh)
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)"
+```
+
+To inspect before running (recommended for production):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh \
+  -o /root/migrateproxmox.sh
+less /root/migrateproxmox.sh
+bash /root/migrateproxmox.sh --target 10.0.0.20 --target-pass 'YOURPASS'
 ```
 
 ---
