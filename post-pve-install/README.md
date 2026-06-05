@@ -21,7 +21,7 @@ A personal fork of the [community-scripts/ProxmoxVE](https://github.com/communit
 ## How to use
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/post-pve-install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/post-pve-install/post-pve-install.sh)"
 ```
 
 > Replace `YOUR_USERNAME/YOUR_REPO` with your actual GitHub username and repository name.
