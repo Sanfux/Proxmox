@@ -32,28 +32,24 @@ Run this script **on the source node** as `root`.
 
 ## Quick Start
 
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)"
-```
-
 With flags:
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)" \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh)" \
   -- --target 10.0.0.20 --target-pass 'YOURPASS'
 ```
 
 Or use environment variables:
 ```bash
-TARGET_HOST=10.0.0.20 TARGET_PASS='YOURPASS' REGEN_MAC=1 \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh)"
+TARGET_HOST=10.0.0.20 TARGET_PASS='YOURPASS' \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh)"
 ```
 
 To inspect before running (recommended for production):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/migrateproxmox.sh \
-  -o /root/migrateproxmox.sh
-less /root/migrateproxmox.sh
-bash /root/migrateproxmox.sh --target 10.0.0.20 --target-pass 'YOURPASS'
+curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh \
+  -o /root/MigrateProxmox.sh
+less /root/MigrateProxmox.sh
+bash /root/MigrateProxmox.sh --target 10.0.0.20 --target-pass 'YOURPASS'
 ```
 
 ---
@@ -93,21 +89,20 @@ bash /root/migrateproxmox.sh --target 10.0.0.20 --target-pass 'YOURPASS'
 
 Migrate everything to a target node:
 ```bash
-./MigrateProxmox.sh --target 10.0.0.20
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh)" \
+  -- --target 10.0.0.20
 ```
 
 Migrate with MAC regeneration and boot test:
 ```bash
-./MigrateProxmox.sh --target tgt.lan --regenerate-mac --test-boot
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh)" \
+  -- --target 10.0.0.20 --regenerate-mac --test-boot
 ```
 
 Migrate only specific VMIDs to a ZFS storage pool on a different bridge:
 ```bash
-./MigrateProxmox.sh --target 10.0.0.20 \
-  --only-ids "100 200" \
-  --storage local-zfs \
-  --bridge vmbr1 \
-  --suffix ''
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Sanfux/Proxmox/main/MigrateProxmox/MigrateProxmox.sh)" \
+  -- --target 10.0.0.20 --only-ids "100 200" --storage local-zfs --bridge vmbr1 --suffix ''
 ```
 
 ---
