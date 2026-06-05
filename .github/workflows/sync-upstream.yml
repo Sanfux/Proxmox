@@ -1,4 +1,74 @@
+name: Sync with Upstream
+
 on:
   schedule:
+    # Check for upstream changes every day at 06:00 UTC
     - cron: "0 6 * * *"
-  workflow_dispatch:
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream script
+        id: fetch
+        run: |
+          UPSTREAM_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/post-pve-install.sh"
+          curl -fsSL "$UPSTREAM_URL" -o upstream-latest.sh
+
+          # Store hash to detect changes
+          NEW_HASH=$(sha256sum upstream-latest.sh | awk '{print $1}')
+          echo "new_hash=$NEW_HASH" >> $GITHUB_OUTPUT
+
+          # Load previously stored hash (if exists)
+          OLD_HASH=""
+          if [ -f ".upstream-hash" ]; then
+            OLD_HASH=$(cat .upstream-hash)
+          fi
+          echo "old_hash=$OLD_HASH" >> $GITHUB_OUTPUT
+
+          if [ "$NEW_HASH" != "$OLD_HASH" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Upstream has changed — re-applying custom settings."
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No upstream changes detected."
+          fi
+
+      - name: Apply custom settings on top of upstream
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          python3 apply-settings.py upstream-latest.sh post-pve-install.sh
+
+      - name: Validate output script
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          bash -n post-pve-install.sh && echo "Syntax OK" || (echo "SYNTAX ERROR in output script!" && exit 1)
+
+      - name: Save new upstream hash
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.fetch.outputs.new_hash }}" > .upstream-hash
+          # Save a copy of upstream for reference / diffing
+          cp upstream-latest.sh upstream-reference.sh
+
+      - name: Commit and push changes
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add post-pve-install.sh upstream-reference.sh .upstream-hash
+          git commit -m "chore: sync with upstream $(date -u +'%Y-%m-%d') — re-applied custom settings"
+          git push
+
+      - name: No changes notice
+        if: steps.fetch.outputs.changed == 'false'
+        run: echo "Nothing to do — script is already up to date with upstream."
